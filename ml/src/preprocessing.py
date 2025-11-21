@@ -1,187 +1,247 @@
-"""
-Preprocessing utilities for the skin disease classification project.
-
-Responsibilities:
-- Resize shortest side to SHORT_SIDE while preserving aspect ratio.
-- Center crop to IMG_SIZE (default 224x224).
-- Scale pixel values to [0, 1].
-- Build tf.data.Dataset objects from a DataFrame with columns:
-    - 'filepath': string path to image on disk
-    - 'label_idx': integer class index
-"""
+# preprocessing.py
 
 from __future__ import annotations
 
-from typing import Tuple
+import os
+from typing import Optional, Tuple
 
-import tensorflow as tf
 import pandas as pd
+import tensorflow as tf
 
-# ---------------------------------------------------------------------
-# Global config (can be overridden by caller if needed)
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------
+# Global config (keep in sync with your model / EfficientNet-Lite4)
+# ---------------------------------------------------------
 
-IMG_SIZE: Tuple[int, int] = (224, 224)   # (height, width)
-SHORT_SIDE: int = 256
-BATCH_SIZE: int = 32
+# For EfficientNet-Lite4, many repos use 300x300 or 380x380.
+# Pick ONE and use it consistently across preprocessing + model.
+IMG_HEIGHT: int = 300
+IMG_WIDTH: int = 300
+NUM_CHANNELS: int = 3
+
 AUTOTUNE = tf.data.AUTOTUNE
-SEED: int = 42
 
 
-# ---------------------------------------------------------------------
-# Core image preprocessing functions
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------
+# DataFrame loading
+# ---------------------------------------------------------
 
-def resize_shortest_side(
-    image: tf.Tensor,
-    short_side: int = SHORT_SIDE
-) -> tf.Tensor:
+def load_dataframe(csv_path: str) -> pd.DataFrame:
     """
-    Resize so that the shortest side of the image equals `short_side`,
-    while preserving aspect ratio.
+    Load a CSV containing at least:
+      - 'filepath': str, path to the image file
+      - 'label_idx': int, numeric class index (0..num_classes-1)
 
-    Args:
-        image: Tensor of shape (H, W, 3), float or uint8.
-        short_side: Desired size of the shortest side in pixels.
-
-    Returns:
-        Resized image tensor with shape (H', W', 3),
-        where min(H', W') == short_side.
+    You can add more columns (e.g., patient_id, split, etc.) if needed.
     """
-    shape = tf.cast(tf.shape(image)[:2], tf.float32)  # (H, W)
-    height, width = shape[0], shape[1]
-    scale = short_side / tf.minimum(height, width)
-    new_height = tf.cast(height * scale, tf.int32)
-    new_width = tf.cast(width * scale, tf.int32)
-    image = tf.image.resize(image, [new_height, new_width])
-    return image
+    df = pd.read_csv(csv_path)
+    if "filepath" not in df.columns:
+        raise ValueError("CSV must contain a 'filepath' column.")
+    if "label_idx" not in df.columns:
+        raise ValueError("CSV must contain a 'label_idx' column.")
+    return df
 
 
-def center_crop(
-    image: tf.Tensor,
-    target_height: int = IMG_SIZE[0],
-    target_width: int = IMG_SIZE[1]
-) -> tf.Tensor:
+# ---------------------------------------------------------
+# Core image preprocessing
+# ---------------------------------------------------------
+
+def _resolve_path(path: tf.Tensor, root_dir: Optional[str]) -> tf.Tensor:
     """
-    Center-crop the image to (target_height, target_width).
-
-    Assumes image height and width are >= target dimensions.
-
-    Args:
-        image: Tensor of shape (H, W, 3).
-        target_height: Height of the crop.
-        target_width: Width of the crop.
-
-    Returns:
-        Cropped image tensor of shape (target_height, target_width, 3).
+    Join a relative path with root_dir if provided.
     """
-    shape = tf.shape(image)
-    height, width = shape[0], shape[1]
-
-    offset_height = tf.cast((height - target_height) / 2, tf.int32)
-    offset_width = tf.cast((width - target_width) / 2, tf.int32)
-
-    image = tf.image.crop_to_bounding_box(
-        image,
-        offset_height,
-        offset_width,
-        target_height,
-        target_width,
-    )
-    return image
+    if root_dir is None:
+        return path
+    # tf.strings.join expects a list of strings
+    return tf.strings.join([root_dir, path], separator=os.sep)
 
 
-def load_and_preprocess_image(path: tf.Tensor) -> tf.Tensor:
+def _load_and_preprocess_image(
+    path: tf.Tensor,
+    label: tf.Tensor,
+    root_dir: Optional[str] = None,
+) -> Tuple[tf.Tensor, tf.Tensor]:
     """
-    Load an image from disk, decode as RGB, convert to float in [0, 1],
-    resize shortest side, and center crop to IMG_SIZE.
+    Low-level preprocessing for a single (path, label) example.
 
-    Args:
-        path: Scalar tf.string tensor containing the file path.
+    Steps:
+      1. Resolve full path (if root_dir is given).
+      2. Read the image from disk.
+      3. Decode JPEG/PNG (3 channels).
+      4. Resize to (IMG_HEIGHT, IMG_WIDTH).
+      5. Cast to float32, keeping pixel values in [0, 255].
 
-    Returns:
-        Tensor of shape (IMG_SIZE[0], IMG_SIZE[1], 3), dtype float32,
-        with values in [0, 1].
+    IMPORTANT:
+      We DO NOT normalize here, so that the EfficientNet-Lite4
+      preprocessing layer (in the model) can apply its canonical
+      normalization (e.g., mapping to [-1, 1]).
     """
-    # Read the raw bytes
+    if root_dir is not None:
+        path = _resolve_path(path, root_dir)
+
+    # 1) Read bytes
     image_bytes = tf.io.read_file(path)
 
-    # Decode image (supports JPEG/PNG/etc.), force 3 channels (RGB)
+    # 2) Decode image (handles JPEG/PNG)
     image = tf.io.decode_image(
         image_bytes,
-        channels=3,
+        channels=NUM_CHANNELS,
         expand_animations=False,
     )
 
-    # Convert to float32 in [0, 1]
-    image = tf.image.convert_image_dtype(image, tf.float32)
+    # 3) Resize
+    image = tf.image.resize(image, [IMG_HEIGHT, IMG_WIDTH])
 
-    # Resize shortest side then center crop
-    image = resize_shortest_side(image, short_side=SHORT_SIDE)
-    image = center_crop(image, target_height=IMG_SIZE[0], target_width=IMG_SIZE[1])
+    # 4) Cast to float32 [0, 255]
+    image = tf.cast(image, tf.float32)
 
-    # Ensure static shape for downstream models
-    image.set_shape((*IMG_SIZE, 3))
-    return image
-
-
-def preprocess_example(
-    path: tf.Tensor,
-    label_idx: tf.Tensor
-) -> Tuple[tf.Tensor, tf.Tensor]:
-    """
-    Preprocess a single (path, label_idx) pair into (image_tensor, label).
-
-    Args:
-        path: Scalar tf.string tensor (image path).
-        label_idx: Scalar int tensor (integer class index).
-
-    Returns:
-        (image, label) where:
-            image: Tensor (IMG_SIZE[0], IMG_SIZE[1], 3), float32 in [0, 1].
-            label: Scalar int32 tensor.
-    """
-    image = load_and_preprocess_image(path)
-    label = tf.cast(label_idx, tf.int32)
     return image, label
 
 
-# ---------------------------------------------------------------------
-# Dataset builders
-# ---------------------------------------------------------------------
-
-def df_to_dataset(
+def _make_base_dataset(
     df: pd.DataFrame,
-    batch_size: int = BATCH_SIZE,
-    shuffle: bool = True,
-    seed: int = SEED,
+    root_dir: Optional[str] = None,
 ) -> tf.data.Dataset:
     """
-    Convert a DataFrame with 'filepath' and 'label_idx' columns
-    into a tf.data.Dataset of (image, label) batches.
+    Create an unbatched tf.data.Dataset from a DataFrame.
 
-    Args:
-        df: Pandas DataFrame with at least 'filepath' and 'label_idx' columns.
-        batch_size: Batch size for the dataset.
-        shuffle: Whether to shuffle the dataset.
-        seed: Random seed for shuffling.
-
-    Returns:
-        A tf.data.Dataset yielding batches of (images, labels), where:
-            images: (batch_size, IMG_SIZE[0], IMG_SIZE[1], 3)
-            labels: (batch_size,)
+    Yields (image_path, label_idx) pairs. Actual image decoding/resizing
+    happens later in a .map() for better performance.
     """
-    if "filepath" not in df.columns or "label_idx" not in df.columns:
-        raise ValueError("DataFrame must contain 'filepath' and 'label_idx' columns.")
-
     paths = df["filepath"].astype(str).values
-    labels = df["label_idx"].astype(int).values
+    labels = df["label_idx"].astype("int32").values
+
+    path_ds = tf.data.Dataset.from_tensor_slices(paths)
+    label_ds = tf.data.Dataset.from_tensor_slices(labels)
+
+    # Dataset of (path, label)
+    ds = tf.data.Dataset.zip((path_ds, label_ds))
+
+    # Attach root_dir via a closure in the map function later
+    if root_dir is not None:
+        # Store root_dir as a tf.constant so it can be captured in the map fn
+        root_dir_tensor = tf.constant(root_dir, dtype=tf.string)
+
+        def _with_root(path, label):
+            # We'll still resolve in the main map, but passing the dir here
+            # keeps the signature (path, label) and avoids adding extra fields.
+            return path, label, root_dir_tensor
+
+        ds = ds.map(
+            lambda p, y: (p, y, root_dir_tensor),
+            num_parallel_calls=AUTOTUNE,
+        )
+    return ds
+
+
+# ---------------------------------------------------------
+# Public helpers to build train/val/test datasets
+# ---------------------------------------------------------
+
+def build_dataset_from_df(
+    df: pd.DataFrame,
+    *,
+    root_dir: Optional[str] = None,
+    batch_size: int = 32,
+    shuffle: bool = True,
+    cache: bool = False,
+    shuffle_buffer: Optional[int] = None,
+) -> tf.data.Dataset:
+    """
+    Build a batched, prefetched tf.data.Dataset from a pandas DataFrame.
+
+    Typical usage:
+        train_df = load_dataframe("processed_train.csv")
+        val_df   = load_dataframe("processed_val.csv")
+        test_df  = load_dataframe("processed_test.csv")
+
+        train_ds = build_dataset_from_df(train_df, root_dir="/data/skin", batch_size=32, shuffle=True, cache=True)
+        val_ds   = build_dataset_from_df(val_df,   root_dir="/data/skin", batch_size=32, shuffle=False, cache=True)
+        test_ds  = build_dataset_from_df(test_df,  root_dir="/data/skin", batch_size=32, shuffle=False, cache=False)
+
+    Best practices it follows:
+      - tf.data for IO & transformation, as recommended by TF guides.
+      - shuffle → map → (cache) → batch → prefetch for performance.
+      - Prefetch(AUTOTUNE) to overlap input pipeline with model compute.
+    """
+
+    # Convert paths + labels into a tf.data.Dataset
+    paths = df["filepath"].astype(str).values
+    labels = df["label_idx"].astype("int32").values
 
     ds = tf.data.Dataset.from_tensor_slices((paths, labels))
-    if shuffle:
-        ds = ds.shuffle(buffer_size=len(df), seed=seed, reshuffle_each_iteration=True)
 
-    ds = ds.map(preprocess_example, num_parallel_calls=AUTOTUNE)
-    ds = ds.batch(batch_size)
+    # Shuffle only when requested (usually train only).
+    if shuffle:
+        if shuffle_buffer is None:
+            # Common pattern: buffer_size ~ dataset size but capped
+            shuffle_buffer = min(len(df), 1000)
+        ds = ds.shuffle(
+            buffer_size=shuffle_buffer,
+            reshuffle_each_iteration=True,
+        )
+
+    # Map: decode + resize + cast.
+    # Use AUTOTUNE for num_parallel_calls for performance.
+    def _process(path, label):
+        return _load_and_preprocess_image(path, label, root_dir=root_dir)
+
+    ds = ds.map(_process, num_parallel_calls=AUTOTUNE)
+
+    # Optional: cache after the expensive map if dataset fits in RAM.
+    if cache:
+        ds = ds.cache()
+
+    # Batch
+    ds = ds.batch(batch_size, drop_remainder=False)
+
+    # Prefetch as the LAST step (official best practice).
     ds = ds.prefetch(AUTOTUNE)
+
     return ds
+
+
+def build_train_val_test_datasets(
+    train_csv: str,
+    val_csv: str,
+    test_csv: Optional[str] = None,
+    *,
+    root_dir: Optional[str] = None,
+    batch_size: int = 32,
+) -> Tuple[tf.data.Dataset, tf.data.Dataset, Optional[tf.data.Dataset]]:
+    """
+    Convenience wrapper if you already have separate CSVs for train/val/test.
+
+    Returns (train_ds, val_ds, test_ds).
+    test_ds may be None if test_csv is not provided.
+    """
+    train_df = load_dataframe(train_csv)
+    val_df = load_dataframe(val_csv)
+    test_df = load_dataframe(test_csv) if test_csv is not None else None
+
+    train_ds = build_dataset_from_df(
+        train_df,
+        root_dir=root_dir,
+        batch_size=batch_size,
+        shuffle=True,
+        cache=True,  # often good for smaller medical datasets
+    )
+
+    val_ds = build_dataset_from_df(
+        val_df,
+        root_dir=root_dir,
+        batch_size=batch_size,
+        shuffle=False,
+        cache=True,
+    )
+
+    test_ds = None
+    if test_df is not None:
+        test_ds = build_dataset_from_df(
+            test_df,
+            root_dir=root_dir,
+            batch_size=batch_size,
+            shuffle=False,
+            cache=False,  # caching optional for test
+        )
+
+    return train_ds, val_ds, test_ds
