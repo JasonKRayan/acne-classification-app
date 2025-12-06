@@ -22,7 +22,6 @@ Validation: ~15%
 
 Test: from dataset’s provided test folder
 
-## Use preprocessing.py only if you don't want to use the processed csvs in ./ml/data/processed
 ## Using preprocessing.py
 
 import pandas as pd

@@ -1,1 +1,6 @@
 ml/data/raw
+ml/src/acne
+.env
+ml/src/__pycache__
+*.pyc
+.vscode/
