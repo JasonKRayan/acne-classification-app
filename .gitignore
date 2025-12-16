@@ -1,4 +1,4 @@
-ml/data/raw
+ml/data
 ml/src/acne
 .env
 ml/src/__pycache__
